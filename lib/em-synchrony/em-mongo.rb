@@ -7,23 +7,19 @@ end
 module EM
   module Mongo
 
-    class Database
-      def authenticate(username, password)
-        auth_result = self.collection(SYSTEM_COMMAND_COLLECTION).first({'getnonce' => 1})
-
-        auth                 = BSON::OrderedHash.new
-        auth['authenticate'] = 1
-        auth['user']         = username
-        auth['nonce']        = auth_result['nonce']
-        auth['key']          = EM::Mongo::Support.auth_key(username, password, auth_result['nonce'])
-
-        auth_result2 = self.collection(SYSTEM_COMMAND_COLLECTION).first(auth)
-        if EM::Mongo::Support.ok?(auth_result2)
-          true
-        else
-          raise AuthenticationError, auth_result2["errmsg"]
-        end
+    def self.sync(response)
+      if response.completed?
+        response.succeeded? ? response.data : fail(response.error)
+      else
+        f = Fiber.current
+        response.callback { |result| f.resume(result) }
+        response.errback { |err| fail(err); f.resume }
+        Fiber.yield
       end
+    end
+
+    def self.fail(error_array)
+      raise error_array[0], error_array[1]
     end
 
     class Connection
@@ -39,93 +35,62 @@ module EM
       end
     end
 
+    class Database
+      %w[get_last_error authenticate add_user].each do |method|
+        class_eval %[
+          alias :a#{method} :#{method}
+          def #{method}(*args)
+            EM::Mongo.sync a#{method}(*args)
+          end
+        ]
+      end  
+    end
+
+    class Cursor
+      %w[to_a explain count].each do |method|
+        class_eval %[
+          alias :a#{method} :#{method}
+          def #{method}(*args)
+            EM::Mongo.sync a#{method}(*args)
+          end
+        ]
+      end  
+    end
+
     class Collection
 
-      #
-      # The upcoming versions of EM-Mongo change Collection#find's interface: it
-      # now returns a deferrable cursor YAY. This breaks compatibility with past
-      # versions BOO. We'll just choose based on the presence/absence of
-      # EM::Mongo::Cursor YAY
-      #
-
-      #
-      # em-mongo version > 0.3.6
-      #
-      if defined?(EM::Mongo::Cursor)
-
-        # afind     is the old (async) find
-        # afind_one is rewritten to call afind
-        # find      is sync, using a callback on the cursor
-        # find_one  is sync, by calling find and taking the first element.
-        # first     is sync, an alias for find_one
-
-        alias :afind :find
-        def find(*args)
-          f = Fiber.current
-          cursor = afind(*args)
-          cursor.to_a.callback{ |res| f.resume(res) }
-          Fiber.yield
-        end
-
-        # need to rewrite afind_one manually, as it calls 'find' (reasonably
-        # expecting it to be what is now known as 'afind')
-
-        def afind_one(spec_or_object_id=nil, opts={})
-          spec = case spec_or_object_id
-                 when nil
-                   {}
-                 when BSON::ObjectId
-                   {:_id => spec_or_object_id}
-                 when Hash
-                   spec_or_object_id
-                 else
-                   raise TypeError, "spec_or_object_id must be an instance of ObjectId or Hash, or nil"
-                 end
-          afind(spec, opts.merge(:limit => -1)).next_document
-        end
-        alias :afirst :afind_one
-
-        def find_one(selector={}, opts={})
-          opts[:limit] = 1
-          find(selector, opts).first
-        end
-        alias :first :find_one
-
-      #
-      # em-mongo version <= 0.3.6
-      #
-      else
-
-        alias :afind :find
-        def find(selector={}, opts={})
-
-          f = Fiber.current
-          cb = proc { |res| f.resume(res) }
-
-          skip  = opts.delete(:skip) || 0
-          limit = opts.delete(:limit) || 0
-          order = opts.delete(:order)
-
-          @connection.find(@name, skip, limit, order, selector, nil, &cb)
-          Fiber.yield
-        end
-
-        # need to rewrite afirst manually, as it calls 'find' (reasonably
-        # expecting it to be what is now known as 'afind')
-
-        def afirst(selector={}, opts={}, &blk)
-          opts[:limit] = 1
-          afind(selector, opts) do |res|
-            yield res.first
+      %w[find_one find_and_modify map_reduce distinct group].each do |method|
+        class_eval %[
+          alias :a#{method} :#{method}
+          def #{method}(*args)
+            EM::Mongo.sync a#{method}(*args)
           end
-        end
+        ]
+      end  
+      
+      #em-mongo's safe_xxxx methods will pre-succeed
+      #their deferrables before they return unless :safe => true,
+      #so these methods will remain fire and forget and
+      #return immediately unless the safe check is requested
 
-        def first(selector={}, opts={})
-          opts[:limit] = 1
-          find(selector, opts).first
-        end
+      def ainsert(doc_or_docs, options = {})
+        options[:safe] = false unless options[:safe] == true
+        safe_insert(doc_or_docs, options)
+      end     
+      def insert(*args); EM::Mongo.sync ainsert(*args); end
+
+      def aupdate(selector, document, options = {})
+        options[:safe] = false unless options[:safe] == true
+        safe_update(selector, document, options)
       end
+      def update(*args); EM::Mongo.sync aupdate(*args); end
 
+      def asave(doc, options={})
+        options[:safe] = false unless options[:safe] == true
+        safe_save(doc, options)
+      end
+      def save(*args); EM::Mongo.sync asave(*args); end
+         
     end
 
   end
